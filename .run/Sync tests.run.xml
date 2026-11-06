@@ -1,0 +1,16 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Sync tests (local PostgreSQL)" type="tests" factoryName="py.test">
+    <module name="test-task-backend-2026" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <envs>
+      <env name="TEST_DATABASE_URL" value="postgresql+psycopg://crm_test@127.0.0.1:55432/crm_test" />
+    </envs>
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="_new_target" value="$PROJECT_DIR$/tests/test_sync.py" />
+    <option name="_new_targetType" value="PATH" />
+    <option name="_new_additionalArguments" value="-q" />
+    <method v="2" />
+  </configuration>
+</component>

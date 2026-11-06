@@ -236,3 +236,77 @@ def test_full_run_can_be_repeated_and_empty_export_clears_rows(postgres, monkeyp
     fetch(monkeypatch)
     main.collect_leads_customers()
     assert rows() == {}
+
+
+@pytest.mark.parametrize("batch_size", [1, 500])
+def test_merge_preserves_fresh_entities_from_both_groups(postgres, monkeypatch, batch_size):
+    monkeypatch.setattr(main, "BATCH_SIZE", batch_size)
+    target = seed(amo_leads=[stored(10)])
+    donor = seed(amo_leads=[stored(11)], amo_customers=[stored(1, "shared")])
+    fetch(
+        monkeypatch,
+        customers=[customer(1, "shared")],
+        leads=[lead(11, name="fresh donor"), lead(10, "shared", name="fresh target")],
+    )
+
+    main.collect_leads_customers()
+
+    result = rows()
+    assert list(result) == [target]
+    assert donor not in result
+    assert ids(result[target].amo_customers) == [1]
+    assert {entry["general"]["id"]: entry["general"]["name"]
+            for entry in result[target].amo_leads} == {10: "fresh target", 11: "fresh donor"}
+
+
+def test_lead_does_not_merge_ambiguous_customer_groups(postgres, monkeypatch):
+    first = seed(amo_customers=[stored(1, "shared")])
+    second = seed(amo_customers=[stored(2, "shared")])
+    target = seed(amo_leads=[stored(10)])
+    fetch(monkeypatch, leads=[lead(10, "shared"), lead(11, "shared")])
+
+    main.collect_leads_customers(is_full=False)
+
+    result = rows()
+    assert ids(result[first].amo_customers) == [1]
+    assert ids(result[second].amo_customers) == [2]
+    assert ids(result[target].amo_leads) == [10]
+    assert len(result) == 4
+    assert sorted(id_ for row in result.values() for id_ in ids(row.amo_leads)) == [10, 11]
+
+
+def test_interrupted_customers_skips_leads_and_cleanup(postgres, monkeypatch):
+    monkeypatch.setattr(main, "BATCH_SIZE", 1)
+    seed(amo_leads=[stored(10)])
+    before = rows()
+
+    def interrupted(cls, **_):
+        assert cls is Customer
+        yield customer(1, "new")
+        raise RuntimeError("customer export interrupted")
+
+    monkeypatch.setattr(main, "amocrm_get", interrupted)
+    monkeypatch.setattr(main, "cleanup", lambda *_: pytest.fail("cleanup after interrupted export"))
+    with pytest.raises(RuntimeError, match="customer export interrupted"):
+        main.collect_leads_customers()
+
+    assert rows() == before
+
+
+def test_cleanup_database_error_rolls_back_sync(postgres, monkeypatch):
+    from sqlalchemy.exc import DBAPIError
+
+    seed(amo_leads=[stored(10)])
+    before = rows()
+    fetch(monkeypatch, customers=[customer(1, "new")])
+    original_cleanup = main.cleanup
+
+    def failing_cleanup(conn, seen):
+        original_cleanup(conn, seen)
+        conn.exec_driver_sql("SELECT 1 / 0")
+
+    monkeypatch.setattr(main, "cleanup", failing_cleanup)
+    with pytest.raises(DBAPIError):
+        main.collect_leads_customers()
+
+    assert rows() == before
