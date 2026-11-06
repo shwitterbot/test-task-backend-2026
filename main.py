@@ -1,175 +1,290 @@
 import logging
-from typing import Iterator, List, Dict
+from collections import defaultdict
+from dataclasses import dataclass, field
+from itertools import islice
+from typing import Optional
 
-from sqlalchemy import delete, select
-from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy import bindparam, delete, func, insert, or_, select, text, true, union
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert as pg_insert
 
-from abstract_customer import get_abccustomer_by_lead_login, create_or_update_customer, \
-    get_abccustomer_by_amocustomer_login, dict_compare_merge, create_or_update_lead
-from amocrm import Customer, COMPANIES, CONTACTS, Lead, amocrm_get
-from models import db, AbstractCustomer
+from abstract_customer import get_customer_json, get_lead_json
+from amocrm import COMPANIES, CONTACTS, Customer, Lead, amocrm_get
+from models import AbstractCustomer, db
 
 logger = logging.getLogger(__name__)
 
+BATCH_SIZE = 500
+CUSTOMERS = "amo_customers"
+LEADS = "amo_leads"
+ENTITY_FIELDS = (CUSTOMERS, LEADS, "amo_contacts", "amo_companies")
+TABLE = AbstractCustomer.__table__
 
-def lead_action(lead: Lead):
-    abstract_customer = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_leads.op('@>')([{'general': {'id': lead.id}}])).first()
-    lead_login = lead.get_field('Логин')
-    if lead_login:
-        abs_customer_login = get_abccustomer_by_amocustomer_login(lead_login)
-        if abstract_customer is None:
-            abstract_customer = abs_customer_login
-        if abs_customer_login is not None:
-            if abs_customer_login.id != abstract_customer.id:
-                abstract_customer.amo_customers = dict_compare_merge(abstract_customer.amo_customers or [],
-                                                                     abs_customer_login.amo_customers or [])
-                abstract_customer.amo_leads = dict_compare_merge(abstract_customer.amo_leads or [],
-                                                                 abs_customer_login.amo_leads or [])
-                abstract_customer.amo_contacts = dict_compare_merge(abstract_customer.amo_contacts or [],
-                                                                    abs_customer_login.amo_contacts or [])
-                abstract_customer.amo_companies = dict_compare_merge(abstract_customer.amo_companies or [],
-                                                                     abs_customer_login.amo_companies or [])
-                flag_modified(abstract_customer, "amo_customers")
-                flag_modified(abstract_customer, "amo_leads")
-                flag_modified(abstract_customer, "amo_contacts")
-                flag_modified(abstract_customer, "amo_companies")
-                db.session.commit()
-                db.session.flush()
-                db.session.delete(abs_customer_login)
-                db.session.commit()
-                return
 
-    return create_or_update_lead(abstract_customer, lead)
+@dataclass(eq=False)
+class Group:
+    id: Optional[int] = None
+    entities: dict[str, dict[int, dict]] = field(
+        default_factory=lambda: {kind: {} for kind in ENTITY_FIELDS}
+    )
+    seen: dict[str, dict[int, bool]] = field(default_factory=dict)
+
+    def values(self):
+        return {kind: list(entities.values()) for kind, entities in self.entities.items()}
+
+
+class Batch:
+    def __init__(self, rows, seen):
+        self.by_id = defaultdict(set)
+        self.by_login = defaultdict(dict)
+        self.dirty = {}
+        self.removed = []
+        self.seen = seen
+        for row in rows:
+            group = Group(id=row.id, seen=seen.get(row.id, {}))
+            for kind in ENTITY_FIELDS:
+                for entity in row[kind] or ():
+                    self.put(group, kind, entity)
+
+    def _index(self, group, kind, entity, delta):
+        if kind not in (CUSTOMERS, LEADS):
+            return
+        general = entity["general"]
+        matches = self.by_id[kind, general["id"]]
+        if delta == 1:
+            matches.add(group)
+        else:
+            matches.remove(group)
+        login = general.get("login")
+        if login:
+            counts = self.by_login[kind, login]
+            count = counts.get(group, 0) + delta
+            if count:
+                counts[group] = count
+            else:
+                del counts[group]
+
+    def put(self, group, kind, entity):
+        entity_id = entity["general"]["id"]
+        entries = group.entities[kind]
+        if entity_id in entries:
+            self._index(group, kind, entries[entity_id], -1)
+        entries[entity_id] = entity
+        self._index(group, kind, entity, 1)
+
+    def find_by_id(self, kind, entity_id):
+        matches = self.by_id.get((kind, entity_id), ())
+        # Older databases may already have duplicate CRM IDs. Prefer the oldest row.
+        return min(matches, key=lambda group: (group.id is None, group.id or 0), default=None)
+
+    def find_by_login(self, kind, login):
+        matches = self.by_login.get((kind, login), ())
+        if len(matches) > 1:
+            logger.warning("Multiple groups for %s with the same login", kind)
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def merge(self, target, source):
+        for kind in ENTITY_FIELDS:
+            for entity_id, entity in source.entities[kind].items():
+                self._index(source, kind, entity, -1)
+                if entity_id not in target.entities[kind] or (
+                    entity_id in source.seen.get(kind, {})
+                    and entity_id not in target.seen.get(kind, {})
+                ):
+                    self.put(target, kind, entity)
+        for kind, ids in source.seen.items():
+            target.seen.setdefault(kind, {}).update(ids)
+        self.dirty.pop(source, None)
+        if source.id is not None:
+            self.removed.append(source.id)
+            self.seen.pop(source.id, None)
+
+    def apply(self, kind, crm_entity, is_full):
+        login = crm_entity.get_field("Логин")
+        group = self.find_by_id(kind, crm_entity.id)
+        if kind == CUSTOMERS:
+            if group is None:
+                group = self.find_by_login(LEADS, login)
+            payload = get_customer_json(crm_entity)
+        else:
+            login_group = self.find_by_login(CUSTOMERS, login) if login else None
+            if group is None:
+                group = login_group
+            elif login_group is not None and login_group is not group:
+                self.merge(group, login_group)
+            payload = get_lead_json(crm_entity)
+
+        if group is None:
+            group = Group()
+        self.put(group, kind, payload)
+        if is_full:
+            group.seen.setdefault(kind, {})[crm_entity.id] = True
+
+        for field_name, related in (
+            ("amo_contacts", crm_entity.contacts),
+            ("amo_companies", crm_entity.companies),
+        ):
+            for reference in related:
+                entity_id = reference["id"]
+                if type(entity_id) is not int:
+                    raise ValueError(f"Invalid CRM ID for {field_name}: {entity_id!r}")
+                old = group.entities[field_name].get(entity_id, {})
+                general = {**old.get("general", {}), "id": entity_id}
+                for key in ("name", "phone", "inn"):
+                    if key in reference:
+                        general[key] = reference[key]
+                self.put(group, field_name, {
+                    "general": general,
+                    "api_value": {**(old.get("api_value") or {}), **reference},
+                })
+                if is_full:
+                    group.seen.setdefault(field_name, {})[entity_id] = True
+        self.dirty[group] = None
+
+    def write(self, conn, is_full):
+        if self.removed:
+            conn.execute(delete(TABLE).where(TABLE.c.id.in_(self.removed)))
+
+        existing = [
+            {"id": group.id, **group.values()}
+            for group in self.dirty if group.id is not None
+        ]
+        new_groups = [group for group in self.dirty if group.id is None]
+        if new_groups:
+            stmt = insert(TABLE).returning(TABLE.c.id, sort_by_parameter_order=True)
+            ids = conn.execute(stmt, [group.values() for group in new_groups]).scalars().all()
+            for group, group_id in zip(new_groups, ids):
+                group.id = group_id
+
+        if existing:
+            stmt = pg_insert(TABLE).values(existing)
+            conn.execute(stmt.on_conflict_do_update(
+                index_elements=[TABLE.c.id],
+                set_={
+                    **{kind: stmt.excluded[kind] for kind in ENTITY_FIELDS},
+                    "updated_at": text("now()"),
+                },
+                where=or_(*(
+                    TABLE.c[kind].is_distinct_from(stmt.excluded[kind]) for kind in ENTITY_FIELDS
+                )),
+            ))
+        if is_full:
+            self.seen.update((group.id, group.seen) for group in self.dirty)
+
+
+def batches(iterable):
+    iterator = iter(iterable)
+    while batch := list(islice(iterator, BATCH_SIZE)):
+        yield batch
+
+
+def matching_group_ids(column, key, values):
+    probes = [[{"general": {key: value}}] for value in values]
+    needles = (
+        func.unnest(bindparam(f"{key}_matches", probes, type_=ARRAY(JSONB, dimensions=1)))
+        .table_valued("needle")
+        .render_derived()
+    )
+    # A parameterized index probe keeps PostgreSQL from comparing every row with every key.
+    matches = (
+        select(TABLE.c.id)
+        .where(column.bool_op("@>")(needles.c.needle))
+        .correlate(needles)
+        .offset(0)
+        .lateral()
+    )
+    return select(matches.c.id).select_from(needles.join(matches, true()))
+
+
+def load_batch(conn, kind, entities, seen):
+    other_kind = LEADS if kind == CUSTOMERS else CUSTOMERS
+    if any(type(entity.id) is not int for entity in entities):
+        raise ValueError(f"Invalid CRM ID in batch for {kind}")
+    ids = dict.fromkeys(entity.id for entity in entities)
+    logins = dict.fromkeys(
+        login for entity in entities if (login := entity.get_field("Логин"))
+    )
+    matches = matching_group_ids(TABLE.c[kind], "id", ids)
+    if logins:
+        matches = union(matches, matching_group_ids(TABLE.c[other_kind], "login", logins))
+    else:
+        matches = matches.distinct()
+    groups = matches.subquery()
+    # Load the matched rows by primary key even when the probe estimates are too high.
+    rows = (
+        select(TABLE.c.id, *(TABLE.c[field] for field in ENTITY_FIELDS))
+        .where(TABLE.c.id == groups.c.id)
+        .correlate(groups)
+        .offset(0)
+        .lateral()
+    )
+    stmt = select(rows).select_from(groups.join(rows, true()))
+    return Batch(conn.execute(stmt).mappings(), seen)
+
+
+def _filtered_array(kind):
+    # Translate only the marker's letters so the comparison also works with C collation.
+    return f"""
+        COALESCE((
+            SELECT jsonb_agg(entry ORDER BY position)
+            FROM jsonb_array_elements(NULLIF(customer.{kind}, 'null'::jsonb))
+                WITH ORDINALITY AS entries(entry, position)
+            WHERE seen.{kind} ? (entry->'general'->>'id')
+              AND strpos(
+                  translate(COALESCE(entry->'general'->>'name', ''), 'УДАЛИТЬ', 'удалить'),
+                  'удалить'
+              ) = 0
+        ), '[]'::jsonb) AS {kind}
+    """
+
+
+def cleanup(conn, seen):
+    columns = ", ".join(f"{kind} jsonb" for kind in ENTITY_FIELDS)
+    fields = ", ".join(_filtered_array(kind) for kind in ENTITY_FIELDS)
+    assignments = ", ".join(f"{kind} = filtered.{kind}" for kind in ENTITY_FIELDS)
+    changes = " OR ".join(f"customer.{kind} IS DISTINCT FROM filtered.{kind}" for kind in ENTITY_FIELDS)
+    stmt = text(f"""
+        WITH filtered AS MATERIALIZED (
+            SELECT customer.id, {fields}
+            FROM {TABLE.name} AS customer
+            JOIN jsonb_to_recordset(:seen) AS seen(id bigint, {columns}) USING (id)
+        )
+        UPDATE {TABLE.name} AS customer
+        SET {assignments}, updated_at = now()
+        FROM filtered
+        WHERE customer.id = filtered.id AND ({changes})
+    """).bindparams(bindparam("seen", type_=JSONB))
+
+    for batch in batches(seen.items()):
+        conn.execute(stmt, {"seen": [{"id": id_, **entities} for id_, entities in batch]})
+
+    conn.execute(text(f"""
+        DELETE FROM {TABLE.name} AS customer
+        WHERE NOT EXISTS (
+            SELECT 1 FROM unnest(:seen_ids) AS seen(id) WHERE seen.id = customer.id
+        ) OR (customer.{CUSTOMERS} = '[]'::jsonb AND customer.{LEADS} = '[]'::jsonb)
+    """).bindparams(bindparam("seen_ids", type_=ARRAY(TABLE.c.id.type))), {"seen_ids": list(seen)})
 
 
 def collect_leads_customers(is_full=True):
-    """
-     Берем всех покупателей, если его нет в бд - делаем новую запись AbstractCutomer, в него кладем.
-     Есть есть - находим его запись по id и перезаписываем
+    """Synchronize CRM groups atomically. The caller supplies the Flask app context."""
+    seen = {}
+    with db.engine.begin() as conn:
+        # Allow readers, but serialize synchronizers and other writes to this table.
+        conn.execute(text(f"LOCK TABLE {TABLE.name} IN SHARE ROW EXCLUSIVE MODE"))
+        for cls, kind, relations, skipped_status in (
+            (Customer, CUSTOMERS, f"{COMPANIES},{CONTACTS}", 111349),
+            (Lead, LEADS, CONTACTS, 143),
+        ):
+            entities = (
+                entity for entity in amocrm_get(cls, _with=relations)
+                if (is_full or entity.status_id != skipped_status)
+                and (kind != CUSTOMERS or entity.get_field("Логин"))
+            )
+            for entities_batch in batches(entities):
+                batch = load_batch(conn, kind, entities_batch, seen)
+                for entity in entities_batch:
+                    batch.apply(kind, entity, is_full)
+                batch.write(conn, is_full)
 
-     Вот так у нас коллектятся все кастомеры
-
-     Далее берутся все лиды. Ищутся их записи в бд по id, если не находится и есть логин
-     - находим его запись по кастомеру с тем же логином, кладем к нему.
-     Если нет логина/нет кастомера - пропускаем. Если нашелся - перезаписываем соответственно
-         abstract_id_customer : {
-        customers: [...],
-        leads: [...],
-        contacts: [...],
-        companies: [...]
-    }
-    """
-    session = db.session
-    customers: Iterator[Customer] = amocrm_get(Customer, _with=f"{COMPANIES},{CONTACTS}")
-    logger.info(f"Collected customers {is_full=}")
-
-    ids_map = {}
-    for customer in customers:
-        if is_full is False and customer.status_id == 111349:
-            continue
-        customer_login = customer.get_field('Логин')
-        if not customer_login:
-            continue
-        abstract_customer = session.query(AbstractCustomer).filter(
-            AbstractCustomer.amo_customers.op('@>')([{'general': {'id': customer.id}}])).first()
-
-        if not abstract_customer:
-            abstract_customer = get_abccustomer_by_lead_login(customer_login)  # почти всегда логины совпадают
-        abstract_customer = create_or_update_customer(abstract_customer, customer)
-        if is_full is True:
-            if abstract_customer.id in ids_map:
-                ids_map[abstract_customer.id]["customers"].append(customer.id)
-                ids_map[abstract_customer.id]["contacts"].extend([c["id"] for c in customer.contacts])
-                ids_map[abstract_customer.id]["companies"].extend([c["id"] for c in customer.companies])
-            else:
-                ids_map[abstract_customer.id] = {
-                    "customers": [customer.id],
-                    "contacts": [c["id"] for c in customer.contacts],
-                    "companies": [c["id"] for c in customer.companies],
-                    "leads": [],
-                }
-        db.session.commit()
-
-    del customers
-    amo_leads: Iterator[Lead] = amocrm_get(Lead, _with=f"{CONTACTS}")
-    logger.info(f"Collected leads {is_full=}")
-    for amo_lead in amo_leads:
-        if is_full is False and amo_lead.status_id == 143:
-            continue
-        try:
-            abc_customer = lead_action(amo_lead)
-            if is_full is True:
-                if abc_customer.id in ids_map:
-                    ids_map[abc_customer.id]["leads"].append(amo_lead.id)
-                    ids_map[abc_customer.id]["contacts"].extend([c["id"] for c in amo_lead.contacts])
-                else:
-                    ids_map[abc_customer.id] = {
-                        "customers": [],
-                        "contacts": [c["id"] for c in amo_lead.contacts],
-                        "companies": [],
-                        "leads": [amo_lead.id],
-                    }
-        except Exception as e:
-            logger.exception(f'{amo_lead} {e}')
-
-    if is_full is False:
-        return
-    try:
-        logger.info("Чистка покупателей общая")
-        stmt = delete(AbstractCustomer).where(
-            AbstractCustomer.id.not_in(ids_map.keys())
-        )
-        db.session.execute(stmt)
-        db.session.commit()
-        logger.info("Чистка покупателей на уровне сущностей")
-        for abc_customer in db.session.scalars(select(AbstractCustomer)).all():
-            filter_abc_customer(abc_customer=abc_customer, ids_map=ids_map)
-    except Exception as e:
-        logger.exception(f"Чистка: {e}")
-
-
-def filter_merge_abstract_customer(abc_customer: AbstractCustomer, attr: str,
-                                   check_ids: List[int]):
-    entity = abc_customer.__getattribute__(attr)
-    for l in entity:
-        entity = [c for c in entity if
-                  'удалить' not in l['general'].get('name').lower() and l['general'].get('id') in check_ids]
-        setattr(abc_customer, attr, entity)
-        flag_modified(abc_customer, attr)
-        db.session.commit()
-
-
-def filter_abc_customer(abc_customer: AbstractCustomer, ids_map: Dict):
-    if abc_customer.amo_leads:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_leads",
-                                           check_ids=ids_map[abc_customer.id]["leads"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_customers:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_customers",
-                                           check_ids=ids_map[abc_customer.id]["customers"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_contacts:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_contacts",
-                                           check_ids=ids_map[abc_customer.id]["contacts"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_companies:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_companies",
-                                           check_ids=ids_map[abc_customer.id]["companies"])
-        except Exception as e:
-            logger.exception(e)
-    if not abc_customer.amo_leads and not abc_customer.amo_customers:
-        db.session.flush()
-        db.session.delete(abc_customer)
-    db.session.commit()
+        if is_full:
+            cleanup(conn, seen)

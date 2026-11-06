@@ -76,7 +76,13 @@ class BaseEntity:
         return str(self)
 
     def get_field(self, field_name):
-        return self.custom_fields_values.get(field_name, {}).get('value')
+        return ((self.custom_fields_values or {}).get(field_name) or {}).get('value')
+
+    def as_dict(self):
+        return {
+            key: value for key, value in vars(self).items()
+            if key not in {'contacts', 'companies', 'tags', '_new_next_date'}
+        }
 
     def set_field(self, field_name, field_value, field_id=None):
         custom_field = self.custom_fields_values.get(field_name)
@@ -202,11 +208,10 @@ class Lead(BaseEntity):
         self.account_id = account_id
         self.custom_fields_values = custom_fields_values
         self._embedded = _embedded
-        self.tags = []
-        self.contacts = []
-        self.companies = []
-        if not _embedded:
-            return
+        embedded = _embedded or {}
+        self.tags = embedded.get(TAGS) or []
+        self.contacts = embedded.get(CONTACTS) or []
+        self.companies = embedded.get(COMPANIES) or []
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -239,7 +244,10 @@ def amocrm_get(obj_cls: Type[BaseEntity],
     base_url = ""
     url = f"{base_url}{obj_cls.url}"
     entity_name = obj_cls.entity_name
-    schema = obj_cls.get_schema(many=True)
+    get_schema = getattr(obj_cls, "get_schema", None)
+    if get_schema is None or not base_url:
+        raise NotImplementedError("Connect a configured CRM adapter to main.amocrm_get")
+    schema = get_schema(many=True)
 
     while True:
         response = None
